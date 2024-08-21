@@ -8,9 +8,10 @@
     ],
     "lockFileMaintenance": {
         "enabled": true,
-        "automerge": true
+        "automerge": false,
+        "schedule": "before 4am on Monday"
     },
-    "prCreation": "not-pending",
+    "prCreation": "immediate",
     "rangeStrategy": "update-lockfile",
     "stabilityDays": 3,
     "github-actions": {

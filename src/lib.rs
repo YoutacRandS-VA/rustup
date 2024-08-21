@@ -1,21 +1,13 @@
 #![deny(rust_2018_idioms)]
 #![allow(
-    clippy::too_many_arguments,
     clippy::type_complexity,
-    clippy::upper_case_acronyms, // see https://github.com/rust-lang/rust-clippy/issues/6974
-    clippy::vec_init_then_push, // uses two different styles of initialization
-    clippy::box_default, // its ugly and outside of inner loops irrelevant
     clippy::result_large_err, // 288 bytes is our 'large' variant today, which is unlikely to be a performance problem
     clippy::arc_with_non_send_sync, // will get resolved as we move further into async
 )]
 #![recursion_limit = "1024"]
 
-pub(crate) use crate::config::*;
-use crate::currentprocess::*;
-pub use crate::errors::*;
-pub(crate) use crate::notifications::*;
-pub(crate) use crate::utils::toml_utils;
 use anyhow::{anyhow, Result};
+use errors::RustupError;
 use itertools::{chain, Itertools};
 
 #[macro_use]
@@ -80,7 +72,6 @@ fn component_for_bin(binary: &str) -> Option<&'static str> {
 pub mod cli;
 mod command;
 mod config;
-pub mod currentprocess;
 mod diskio;
 pub mod dist;
 pub mod env_var;
@@ -88,6 +79,7 @@ pub mod errors;
 mod fallback_settings;
 mod install;
 pub mod notifications;
+pub mod process;
 mod settings;
 #[cfg(feature = "test")]
 pub mod test;
@@ -96,8 +88,6 @@ pub mod utils;
 
 #[cfg(test)]
 mod tests {
-    use rustup_macros::unit_test as test;
-
     use crate::{is_proxyable_tools, DUP_TOOLS, TOOLS};
 
     #[test]

@@ -1,6 +1,76 @@
 # Changelog
 
-## [1.27.0] - 2024-01-29
+## [1.27.1] - 2024-04-14
+
+This new Rustup release involves some minor bug fixes.
+
+The headlines for this release are:
+
+1. Prebuilt Rustup binaries should be working on older macOS versions again.
+2. `rustup-init` will no longer fail when `fish` is installed but `~/.config/fish/conf.d` hasn't been created.
+3. Regressions regarding symlinked `RUSTUP_HOME/(toolchains|downloads|tmp)` have been addressed.
+
+Since the release of 1.27.0, the project has welcomed a total of 7 new contributors.
+Many thanks for your hard work, and we hope to see you again!
+
+### Added
+
+- Added the logging of `RUSTUP_UPDATE_ROOT` and `RUSTUP_DIST_(SERVER|ROOT)` when `RUSTUP_DEBUG` is set [pr#3722]
+
+### Changed
+
+- Ensured that CI builds target macOS 10.12+ on x64 and macOS 11.0+ on arm64 [pr#3710]
+- Fixed an error when writing to rcfiles by ensuring the creation of their parent dir(s) first [pr#3712]
+- Fixed unexpected errors when `RUSTUP_HOME/(toolchains|downloads|tmp)` is symlinked [pr#3742] [pr#3754]
+- Fixed an unexpected error when removing a component by component name with explicit target triple [pr#3601]
+- Changed `RUSTUP_WINDOWS_PATH_ADD_BIN` to be false by default [pr#3703]
+- Fixed incorrect color state after `ColorableTerminal::reset` [pr#3711]
+- Replaced `.` with `source` in fish shell's `source_string` [pr#3715]
+- Fixed "component add" error message format [pr#3724]
+- Fixed file paths in CI-generated `*.sha256` files on *nix [pr#3730]
+- Removed an unnecessary debug print [pr#3734]
+- Disabled the "doc opening" output on `rustup doc --path` [pr#3748]
+- Fixed the update of `DisplayVersion` in the Windows registry on `rustup self update` [pr#3770]
+- Bumped a lot of dependencies to their latest versions [pr#renovate-bot]
+
+Thanks go to:
+
+- Anas (0x61nas)
+- cuiyourong (cuiyourong)
+- Dirkjan Ochtman (djc)
+- Eric Huss (ehuss)
+- eth3lbert (eth3lbert)
+- hev (heiher)
+- klensy (klensy)
+- Chih Wang (ongchi)
+- Adam (pie-flavor)
+- rami3l (rami3l)
+- Robert (rben01)
+- Robert Collins (rbtcollins)
+- Sun Bin (shandongbinzhou)
+- Samuel Moelius (smoelius)
+- vpochapuis (vpochapuis)
+- Renovate Bot (renovate)
+
+**Full Changelog**: https://github.com/rust-lang/rustup/compare/1.27.0...1.27.1
+
+[1.27.1]: https://github.com/rust-lang/rustup/releases/tag/1.27.1
+[pr#3601]: https://github.com/rust-lang/rustup/pull/3601
+[pr#3703]: https://github.com/rust-lang/rustup/pull/3703
+[pr#3711]: https://github.com/rust-lang/rustup/pull/3711
+[pr#3715]: https://github.com/rust-lang/rustup/pull/3715
+[pr#3710]: https://github.com/rust-lang/rustup/pull/3710
+[pr#3712]: https://github.com/rust-lang/rustup/pull/3712
+[pr#3722]: https://github.com/rust-lang/rustup/pull/3722
+[pr#3724]: https://github.com/rust-lang/rustup/pull/3724
+[pr#3730]: https://github.com/rust-lang/rustup/pull/3730
+[pr#3734]: https://github.com/rust-lang/rustup/pull/3734
+[pr#3748]: https://github.com/rust-lang/rustup/pull/3748
+[pr#3742]: https://github.com/rust-lang/rustup/pull/3742
+[pr#3754]: https://github.com/rust-lang/rustup/pull/3754
+[pr#3770]: https://github.com/rust-lang/rustup/pull/3770
+
+## [1.27.0] - 2024-03-08
 
 This long-awaited Rustup release has gathered all the new features and fixes since April 2023.
 These changes include improvements in Rustup's maintainability, user experience, compatibility and documentation quality.
@@ -11,7 +81,7 @@ The headlines of this release are:
 
 Also, it's worth mentioning that Dirkjan Ochtman and rami3l have joined the team and are coordinating this new release.
 
-Finally, the project seems to have attracted a total of 21 new contributors within this release cycle. Looking forward to seeing you again in the future!
+Finally, the project seems to have attracted a total of 23 new contributors within this release cycle. Looking forward to seeing you again in the future!
 
 ### Added
 
@@ -32,6 +102,7 @@ Finally, the project seems to have attracted a total of 21 new contributors with
 - Fix handling of toolchain names with special characters [pr#3518]
 - Fix panic in `component list --toolchain stable` [pr#3548]
 - Rename `llvm-tools-preview` component to `llvm-tools` [pr#3578]
+- Try using symlinks if possible on Windows [pr#3687]
 - Bump a lot of dependencies to their latest versions [pr#renovate-bot]
 
 Thanks go to:
@@ -41,6 +112,7 @@ Thanks go to:
 - Alex Gaynor (alex)
 - Alex Hudspith (alexhudspith)
 - Alan Somers (asomers)
+- Brett (brettearle)
 - Burak Emir (burakemir)
 - Chris Denton (ChrisDenton)
 - cui fliter (cuishuang)
@@ -57,6 +129,7 @@ Thanks go to:
 - Matt Harding (majaha)
 - Mathias Brossard (mbrossard)
 - Christian Thackston (nan60)
+- Ruohui Wang (noirgif)
 - Olivier Lemasle (olivierlemasle)
 - Chih Wang (ongchi)
 - Pavel Roskin (proski)
@@ -87,6 +160,7 @@ Thanks go to:
 [pr#3518]: https://github.com/rust-lang/rustup/pull/3518
 [pr#3548]: https://github.com/rust-lang/rustup/pull/3548
 [pr#3578]: https://github.com/rust-lang/rustup/pull/3578
+[pr#3687]: https://github.com/rust-lang/rustup/pull/3687
 
 ## [1.26.0] - 2023-04-05
 

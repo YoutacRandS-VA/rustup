@@ -1,82 +1,85 @@
 use std::env::{consts::EXE_SUFFIX, split_paths};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+#[cfg(any(test, feature = "test"))]
+use std::io;
 use std::io::Write;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
+#[cfg(any(test, feature = "test"))]
+use std::sync::{LockResult, MutexGuard};
 
 use anyhow::{anyhow, Context, Result};
+use tracing::{info, warn};
+use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+#[cfg(any(test, feature = "test"))]
+use winreg::types::{FromRegValue, ToRegValue};
+use winreg::{RegKey, RegValue};
 
 use super::super::errors::*;
 use super::common;
-use super::{install_bins, InstallOpts};
-use crate::cli::download_tracker::DownloadTracker;
-use crate::currentprocess::{filesource::StdoutSource, varsource::VarSource};
-use crate::dist::dist::TargetTriple;
-use crate::process;
+use super::{install_bins, report_error, InstallOpts};
+use crate::cli::{download_tracker::DownloadTracker, markdown::md};
+use crate::dist::TargetTriple;
+use crate::process::{terminalsource::ColorableTerminal, Process};
 use crate::utils::utils;
 use crate::utils::Notification;
 
-use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
-use winreg::{RegKey, RegValue};
-
-pub(crate) fn ensure_prompt() -> Result<()> {
-    writeln!(process().stdout().lock(),)?;
-    writeln!(
-        process().stdout().lock(),
-        "Press the Enter key to continue."
-    )?;
-    common::read_line()?;
+pub(crate) fn ensure_prompt(process: &Process) -> Result<()> {
+    writeln!(process.stdout().lock(),)?;
+    writeln!(process.stdout().lock(), "Press the Enter key to continue.")?;
+    common::read_line(process)?;
     Ok(())
 }
 
-fn choice(max: u8) -> Result<Option<u8>> {
-    write!(process().stdout().lock(), ">")?;
+fn choice(max: u8, process: &Process) -> Result<Option<u8>> {
+    write!(process.stdout().lock(), ">")?;
 
     let _ = std::io::stdout().flush();
-    let input = common::read_line()?;
+    let input = common::read_line(process)?;
 
     let r = match str::parse(&input) {
         Ok(n) if n <= max => Some(n),
         _ => None,
     };
 
-    writeln!(process().stdout().lock())?;
+    writeln!(process.stdout().lock())?;
     Ok(r)
 }
 
-pub(crate) fn choose_vs_install() -> Result<Option<VsInstallPlan>> {
+pub(crate) fn choose_vs_install(process: &Process) -> Result<Option<VsInstallPlan>> {
     writeln!(
-        process().stdout().lock(),
+        process.stdout().lock(),
         "\n1) Quick install via the Visual Studio Community installer"
     )?;
     writeln!(
-        process().stdout().lock(),
+        process.stdout().lock(),
         "   (free for individuals, academic uses, and open source)."
     )?;
     writeln!(
-        process().stdout().lock(),
+        process.stdout().lock(),
         "\n2) Manually install the prerequisites"
     )?;
     writeln!(
-        process().stdout().lock(),
+        process.stdout().lock(),
         "   (for enterprise and advanced users)."
     )?;
     writeln!(
-        process().stdout().lock(),
+        process.stdout().lock(),
         "\n3) Don't install the prerequisites"
     )?;
     writeln!(
-        process().stdout().lock(),
+        process.stdout().lock(),
         "   (if you're targeting the GNU ABI).\n"
     )?;
 
     let choice = loop {
-        if let Some(n) = choice(3)? {
+        if let Some(n) = choice(3, process)? {
             break n;
         }
-        writeln!(process().stdout().lock(), "Select option 1, 2 or 3")?;
+        writeln!(process.stdout().lock(), "Select option 1, 2 or 3")?;
     };
     let plan = match choice {
         1 => Some(VsInstallPlan::Automatic),
@@ -86,6 +89,90 @@ pub(crate) fn choose_vs_install() -> Result<Option<VsInstallPlan>> {
     Ok(plan)
 }
 
+pub(super) async fn maybe_install_msvc(
+    term: &mut ColorableTerminal,
+    no_prompt: bool,
+    quiet: bool,
+    opts: &InstallOpts<'_>,
+    process: &Process,
+) -> Result<()> {
+    let Some(plan) = do_msvc_check(opts, process) else {
+        return Ok(());
+    };
+
+    if no_prompt {
+        warn!("installing msvc toolchain without its prerequisites");
+    } else if !quiet && plan == VsInstallPlan::Automatic {
+        md(term, MSVC_AUTO_INSTALL_MESSAGE);
+        match choose_vs_install(process)? {
+            Some(VsInstallPlan::Automatic) => {
+                match try_install_msvc(opts, process).await {
+                    Err(e) => {
+                        // Make sure the console doesn't exit before the user can
+                        // see the error and give the option to continue anyway.
+                        report_error(&e, process);
+                        if !common::question_bool("\nContinue?", false, process)? {
+                            info!("aborting installation");
+                        }
+                    }
+                    Ok(ContinueInstall::No) => ensure_prompt(process)?,
+                    _ => {}
+                }
+            }
+            Some(VsInstallPlan::Manual) => {
+                md(term, MSVC_MANUAL_INSTALL_MESSAGE);
+                if !common::question_bool("\nContinue?", false, process)? {
+                    info!("aborting installation");
+                }
+            }
+            None => {}
+        }
+    } else {
+        md(term, MSVC_MESSAGE);
+        md(term, MSVC_MANUAL_INSTALL_MESSAGE);
+        if !common::question_bool("\nContinue?", false, process)? {
+            info!("aborting installation");
+        }
+    }
+
+    Ok(())
+}
+
+static MSVC_MESSAGE: &str = r#"# Rust Visual C++ prerequisites
+
+Rust requires the Microsoft C++ build tools for Visual Studio 2017 or
+later, but they don't seem to be installed.
+
+"#;
+
+static MSVC_MANUAL_INSTALL_MESSAGE: &str = r#"
+You can acquire the build tools by installing Microsoft Visual Studio.
+
+    https://visualstudio.microsoft.com/downloads/
+
+Check the box for "Desktop development with C++" which will ensure that the
+needed components are installed. If your locale language is not English,
+then additionally check the box for English under Language packs.
+
+For more details see:
+
+    https://rust-lang.github.io/rustup/installation/windows-msvc.html
+
+_Install the C++ build tools before proceeding_.
+
+If you will be targeting the GNU ABI or otherwise know what you are
+doing then it is fine to continue installation without the build
+tools, but otherwise, install the C++ build tools before proceeding.
+"#;
+
+static MSVC_AUTO_INSTALL_MESSAGE: &str = r#"# Rust Visual C++ prerequisites
+
+Rust requires a linker and Windows API libraries but they don't seem to be available.
+
+These components can be acquired through a Visual Studio installer.
+
+"#;
+
 #[derive(PartialEq, Eq)]
 pub(crate) enum VsInstallPlan {
     Automatic,
@@ -94,9 +181,9 @@ pub(crate) enum VsInstallPlan {
 
 // Provide guidance about setting up MSVC if it doesn't appear to be
 // installed
-pub(crate) fn do_msvc_check(opts: &InstallOpts<'_>) -> Option<VsInstallPlan> {
+pub(crate) fn do_msvc_check(opts: &InstallOpts<'_>, process: &Process) -> Option<VsInstallPlan> {
     // Test suite skips this since it's env dependent
-    if process().var("RUSTUP_INIT_SKIP_MSVC_CHECK").is_ok() {
+    if process.var("RUSTUP_INIT_SKIP_MSVC_CHECK").is_ok() {
         return None;
     }
 
@@ -104,7 +191,7 @@ pub(crate) fn do_msvc_check(opts: &InstallOpts<'_>) -> Option<VsInstallPlan> {
     let host_triple = if let Some(trip) = opts.default_host_triple.as_ref() {
         trip.to_owned()
     } else {
-        TargetTriple::from_host_or_build().to_string()
+        TargetTriple::from_host_or_build(process).to_string()
     };
     let installing_msvc = host_triple.contains("msvc");
     let have_msvc = windows_registry::find_tool(&host_triple, "cl.exe").is_some();
@@ -170,7 +257,10 @@ pub(crate) enum ContinueInstall {
 ///
 /// Returns `Ok(ContinueInstall::No)` if installing Visual Studio was successful
 /// but the rustup install should not be continued at this time.
-pub(crate) fn try_install_msvc(opts: &InstallOpts<'_>) -> Result<ContinueInstall> {
+pub(crate) async fn try_install_msvc(
+    opts: &InstallOpts<'_>,
+    process: &Process,
+) -> Result<ContinueInstall> {
     // download the installer
     let visual_studio_url = utils::parse_url("https://aka.ms/vs/17/release/vs_community.exe")?;
 
@@ -180,18 +270,24 @@ pub(crate) fn try_install_msvc(opts: &InstallOpts<'_>) -> Result<ContinueInstall
         .context("error creating temp directory")?;
 
     let visual_studio = tempdir.path().join("vs_setup.exe");
-    let download_tracker = DownloadTracker::new_with_display_progress(true);
+    let download_tracker = Arc::new(Mutex::new(DownloadTracker::new_with_display_progress(
+        true, process,
+    )));
     download_tracker.lock().unwrap().download_finished();
 
     info!("downloading Visual Studio installer");
-    utils::download_file(&visual_studio_url, &visual_studio, None, &move |n| {
-        download_tracker
-            .lock()
-            .unwrap()
-            .handle_notification(&crate::Notification::Install(
-                crate::dist::Notification::Utils(n),
-            ));
-    })?;
+    utils::download_file(
+        &visual_studio_url,
+        &visual_studio,
+        None,
+        &move |n| {
+            download_tracker.lock().unwrap().handle_notification(
+                &crate::notifications::Notification::Install(crate::dist::Notification::Utils(n)),
+            );
+        },
+        process,
+    )
+    .await?;
 
     // Run the installer. Arguments are documented at:
     // https://docs.microsoft.com/en-us/visualstudio/install/use-command-line-parameters-to-install-visual-studio
@@ -206,7 +302,7 @@ pub(crate) fn try_install_msvc(opts: &InstallOpts<'_>) -> Result<ContinueInstall
 
     // It's possible an earlier or later version of the Windows SDK has been
     // installed separately from Visual Studio so installing it can be skipped.
-    if !has_windows_sdk_libs() {
+    if !has_windows_sdk_libs(process) {
         cmd.args([
             "--add",
             "Microsoft.VisualStudio.Component.Windows11SDK.22000",
@@ -239,8 +335,8 @@ pub(crate) fn try_install_msvc(opts: &InstallOpts<'_>) -> Result<ContinueInstall
                 // It's possible that the installer returned a non-zero exit code
                 // even though the required components were successfully installed.
                 // In that case we warn about the error but continue on.
-                let have_msvc = do_msvc_check(opts).is_none();
-                let has_libs = has_windows_sdk_libs();
+                let have_msvc = do_msvc_check(opts, process).is_none();
+                let has_libs = has_windows_sdk_libs(process);
                 if have_msvc && has_libs {
                     warn!("Visual Studio is installed but a problem occurred during installation");
                     warn!("{}", err);
@@ -253,8 +349,8 @@ pub(crate) fn try_install_msvc(opts: &InstallOpts<'_>) -> Result<ContinueInstall
     }
 }
 
-fn has_windows_sdk_libs() -> bool {
-    if let Some(paths) = process().var_os("lib") {
+fn has_windows_sdk_libs(process: &Process) -> bool {
+    if let Some(paths) = process.var_os("lib") {
         for mut path in split_paths(&paths) {
             path.push("kernel32.lib");
             if path.exists() {
@@ -266,14 +362,14 @@ fn has_windows_sdk_libs() -> bool {
 }
 
 /// Run by rustup-gc-$num.exe to delete CARGO_HOME
-#[cfg_attr(feature = "otel", tracing::instrument)]
-pub fn complete_windows_uninstall() -> Result<utils::ExitCode> {
+#[tracing::instrument(level = "trace")]
+pub fn complete_windows_uninstall(process: &Process) -> Result<utils::ExitCode> {
     use std::process::Stdio;
 
     wait_for_parent()?;
 
     // Now that the parent has exited there are hopefully no more files open in CARGO_HOME
-    let cargo_home = utils::cargo_home()?;
+    let cargo_home = process.cargo_home()?;
     utils::remove_dir("cargo_home", &cargo_home, &|_: Notification<'_>| ())?;
 
     // Now, run a *system* binary to inherit the DELETE_ON_CLOSE
@@ -294,15 +390,14 @@ pub fn complete_windows_uninstall() -> Result<utils::ExitCode> {
 pub(crate) fn wait_for_parent() -> Result<()> {
     use std::io;
     use std::mem;
-    use winapi::shared::minwindef::DWORD;
-    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-    use winapi::um::processthreadsapi::{GetCurrentProcessId, OpenProcess};
-    use winapi::um::synchapi::WaitForSingleObject;
-    use winapi::um::tlhelp32::{
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE, WAIT_OBJECT_0};
+    use windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
     };
-    use winapi::um::winbase::{INFINITE, WAIT_OBJECT_0};
-    use winapi::um::winnt::SYNCHRONIZE;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcessId, OpenProcess, WaitForSingleObject, INFINITE,
+    };
 
     unsafe {
         // Take a snapshot of system processes, one of which is ours
@@ -318,7 +413,7 @@ pub(crate) fn wait_for_parent() -> Result<()> {
         });
 
         let mut entry: PROCESSENTRY32 = mem::zeroed();
-        entry.dwSize = mem::size_of::<PROCESSENTRY32>() as DWORD;
+        entry.dwSize = mem::size_of::<PROCESSENTRY32>() as u32;
 
         // Iterate over system processes looking for ours
         let success = Process32First(*snapshot, &mut entry);
@@ -364,15 +459,16 @@ pub(crate) fn wait_for_parent() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn do_add_to_path() -> Result<()> {
-    let new_path = _with_path_cargo_home_bin(_add_to_path)?;
-    _apply_new_path(new_path)
+pub(crate) fn do_add_to_path(process: &Process) -> Result<()> {
+    let new_path = _with_path_cargo_home_bin(_add_to_path, process)?;
+    _apply_new_path(new_path)?;
+    do_add_to_programs(process)
 }
 
 fn _apply_new_path(new_path: Option<Vec<u16>>) -> Result<()> {
     use std::ptr;
-    use winapi::shared::minwindef::*;
-    use winapi::um::winuser::{
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutA, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
     };
 
@@ -482,31 +578,42 @@ fn _remove_from_path(old_path: Vec<u16>, path_str: Vec<u16>) -> Option<Vec<u16>>
     Some(new_path)
 }
 
-fn _with_path_cargo_home_bin<F>(f: F) -> Result<Option<Vec<u16>>>
+fn _with_path_cargo_home_bin<F>(f: F, process: &Process) -> Result<Option<Vec<u16>>>
 where
     F: FnOnce(Vec<u16>, Vec<u16>) -> Option<Vec<u16>>,
 {
     let windows_path = get_windows_path_var()?;
-    let mut path_str = utils::cargo_home()?;
+    let mut path_str = process.cargo_home()?;
     path_str.push("bin");
     Ok(windows_path
         .and_then(|old_path| f(old_path, OsString::from(path_str).encode_wide().collect())))
 }
 
-pub(crate) fn do_remove_from_path() -> Result<()> {
-    let new_path = _with_path_cargo_home_bin(_remove_from_path)?;
-    _apply_new_path(new_path)
+pub(crate) fn do_remove_from_path(process: &Process) -> Result<()> {
+    let new_path = _with_path_cargo_home_bin(_remove_from_path, process)?;
+    _apply_new_path(new_path)?;
+    do_remove_from_programs()
 }
 
 const RUSTUP_UNINSTALL_ENTRY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Rustup";
 
-pub(crate) fn do_add_to_programs() -> Result<()> {
-    use std::path::PathBuf;
-
-    let key = RegKey::predef(HKEY_CURRENT_USER)
+fn rustup_uninstall_reg_key() -> Result<RegKey> {
+    Ok(RegKey::predef(HKEY_CURRENT_USER)
         .create_subkey(RUSTUP_UNINSTALL_ENTRY)
         .context("Failed creating uninstall key")?
-        .0;
+        .0)
+}
+
+pub(crate) fn do_update_programs_display_version(version: &str) -> Result<()> {
+    rustup_uninstall_reg_key()?
+        .set_value("DisplayVersion", &version)
+        .context("Failed to set `DisplayVersion`")
+}
+
+pub(crate) fn do_add_to_programs(process: &Process) -> Result<()> {
+    use std::path::PathBuf;
+
+    let key = rustup_uninstall_reg_key()?;
 
     // Don't overwrite registry if Rustup is already installed
     let prev = key
@@ -520,7 +627,7 @@ pub(crate) fn do_add_to_programs() -> Result<()> {
         }
     }
 
-    let mut path = utils::cargo_home()?;
+    let mut path = process.cargo_home()?;
     path.push("bin\\rustup.exe");
     let mut uninstall_cmd = OsString::from("\"");
     uninstall_cmd.push(path);
@@ -531,14 +638,11 @@ pub(crate) fn do_add_to_programs() -> Result<()> {
         vtype: RegType::REG_SZ,
     };
 
-    let current_version: &str = env!("CARGO_PKG_VERSION");
-
     key.set_raw_value("UninstallString", &reg_value)
-        .context("Failed to set uninstall string")?;
+        .context("Failed to set `UninstallString`")?;
     key.set_value("DisplayName", &"Rustup: the Rust toolchain installer")
-        .context("Failed to set display name")?;
-    key.set_value("DisplayVersion", &current_version)
-        .context("Failed to set display version")?;
+        .context("Failed to set `DisplayName`")?;
+    do_update_programs_display_version(env!("CARGO_PKG_VERSION"))?;
 
     Ok(())
 }
@@ -586,12 +690,18 @@ pub(crate) fn run_update(setup_path: &Path) -> Result<utils::ExitCode> {
         .spawn()
         .context("unable to run updater")?;
 
+    let Some(version) = super::get_and_parse_new_rustup_version(setup_path) else {
+        warn!("failed to get the new rustup version in order to update `DisplayVersion`");
+        return Ok(utils::ExitCode(1));
+    };
+    do_update_programs_display_version(&version)?;
+
     Ok(utils::ExitCode(0))
 }
 
-pub(crate) fn self_replace() -> Result<utils::ExitCode> {
+pub(crate) fn self_replace(process: &Process) -> Result<utils::ExitCode> {
     wait_for_parent()?;
-    install_bins()?;
+    install_bins(process)?;
 
     Ok(utils::ExitCode(0))
 }
@@ -626,21 +736,20 @@ pub(crate) fn self_replace() -> Result<utils::ExitCode> {
 //
 // .. augmented with this SO answer
 // https://stackoverflow.com/questions/10319526/understanding-a-self-deleting-program-in-c
-pub(crate) fn delete_rustup_and_cargo_home() -> Result<()> {
+pub(crate) fn delete_rustup_and_cargo_home(process: &Process) -> Result<()> {
     use std::io;
     use std::mem;
     use std::ptr;
     use std::thread;
     use std::time::Duration;
-    use winapi::shared::minwindef::DWORD;
-    use winapi::um::fileapi::{CreateFileW, OPEN_EXISTING};
-    use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
-    use winapi::um::minwinbase::SECURITY_ATTRIBUTES;
-    use winapi::um::winbase::FILE_FLAG_DELETE_ON_CLOSE;
-    use winapi::um::winnt::{FILE_SHARE_DELETE, FILE_SHARE_READ, GENERIC_READ};
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_DELETE_ON_CLOSE, FILE_SHARE_DELETE, FILE_SHARE_READ, OPEN_EXISTING,
+    };
 
     // CARGO_HOME, hopefully empty except for bin/rustup.exe
-    let cargo_home = utils::cargo_home()?;
+    let cargo_home = process.cargo_home()?;
     // The rustup.exe bin
     let rustup_path = cargo_home.join(format!("bin/rustup{EXE_SUFFIX}"));
 
@@ -658,8 +767,8 @@ pub(crate) fn delete_rustup_and_cargo_home() -> Result<()> {
     let gc_exe_win: Vec<_> = gc_exe.as_os_str().encode_wide().chain(Some(0)).collect();
 
     // Make the sub-process opened by gc exe inherit its attribute.
-    let mut sa = SECURITY_ATTRIBUTES {
-        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as DWORD,
+    let sa = SECURITY_ATTRIBUTES {
+        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
         bInheritHandle: 1,
     };
@@ -671,7 +780,7 @@ pub(crate) fn delete_rustup_and_cargo_home() -> Result<()> {
             gc_exe_win.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_DELETE,
-            &mut sa,
+            &sa,
             OPEN_EXISTING,
             FILE_FLAG_DELETE_ON_CLOSE,
             ptr::null_mut(),
@@ -703,18 +812,85 @@ pub(crate) fn delete_rustup_and_cargo_home() -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(test, feature = "test"))]
+pub fn get_path() -> io::Result<Option<RegValue>> {
+    USER_PATH.get()
+}
+
+#[cfg(any(test, feature = "test"))]
+pub struct RegistryGuard<'a> {
+    _locked: LockResult<MutexGuard<'a, ()>>,
+    id: &'static RegistryValueId,
+    prev: Option<RegValue>,
+}
+
+#[cfg(any(test, feature = "test"))]
+impl<'a> RegistryGuard<'a> {
+    pub fn new(id: &'static RegistryValueId) -> io::Result<Self> {
+        Ok(Self {
+            _locked: REGISTRY_LOCK.lock(),
+            id,
+            prev: id.get()?,
+        })
+    }
+}
+
+#[cfg(any(test, feature = "test"))]
+impl<'a> Drop for RegistryGuard<'a> {
+    fn drop(&mut self) {
+        self.id.set(self.prev.as_ref()).unwrap();
+    }
+}
+
+#[cfg(any(test, feature = "test"))]
+static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(any(test, feature = "test"))]
+pub const USER_PATH: RegistryValueId = RegistryValueId {
+    sub_key: "Environment",
+    value_name: "PATH",
+};
+
+#[cfg(any(test, feature = "test"))]
+pub struct RegistryValueId {
+    pub sub_key: &'static str,
+    pub value_name: &'static str,
+}
+
+#[cfg(any(test, feature = "test"))]
+impl RegistryValueId {
+    pub fn get_value<T: FromRegValue>(&self) -> io::Result<Option<T>> {
+        self.get()?.map(|v| T::from_reg_value(&v)).transpose()
+    }
+
+    fn get(&self) -> io::Result<Option<RegValue>> {
+        let sub_key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(self.sub_key, KEY_READ | KEY_WRITE)?;
+        match sub_key.get_raw_value(self.value_name) {
+            Ok(val) => Ok(Some(val)),
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn set_value(&self, new: Option<impl ToRegValue>) -> io::Result<()> {
+        self.set(new.map(|s| s.to_reg_value()).as_ref())
+    }
+
+    fn set(&self, new: Option<&RegValue>) -> io::Result<()> {
+        let sub_key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(self.sub_key, KEY_READ | KEY_WRITE)?;
+        match new {
+            Some(new) => sub_key.set_raw_value(self.value_name, new),
+            None => sub_key.delete_value(self.value_name),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsString;
-    use std::os::windows::ffi::OsStrExt;
-
-    use winreg::enums::{RegType, HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
-    use winreg::{RegKey, RegValue};
-
-    use rustup_macros::unit_test as test;
-
-    use crate::currentprocess;
-    use crate::test::with_saved_path;
+    use super::*;
+    use crate::process::TestProcess;
 
     fn wide(str: &str) -> Vec<u16> {
         OsString::from(str).encode_wide().collect()
@@ -754,29 +930,25 @@ mod tests {
     #[test]
     fn windows_path_regkey_type() {
         // per issue #261, setting PATH should use REG_EXPAND_SZ.
-        let tp = currentprocess::TestProcess::default();
-        with_saved_path(&mut || {
-            currentprocess::with(tp.clone().into(), || {
-                let root = RegKey::predef(HKEY_CURRENT_USER);
-                let environment = root
-                    .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-                    .unwrap();
-                environment.delete_value("PATH").unwrap();
+        let _guard = RegistryGuard::new(&USER_PATH);
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let environment = root
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+            .unwrap();
+        environment.delete_value("PATH").unwrap();
 
-                {
-                    // Can't compare the Results as Eq isn't derived; thanks error-chain.
-                    #![allow(clippy::unit_cmp)]
-                    assert_eq!((), super::_apply_new_path(Some(wide("foo"))).unwrap());
-                }
-                let root = RegKey::predef(HKEY_CURRENT_USER);
-                let environment = root
-                    .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-                    .unwrap();
-                let path = environment.get_raw_value("PATH").unwrap();
-                assert_eq!(path.vtype, RegType::REG_EXPAND_SZ);
-                assert_eq!(super::to_winreg_bytes(wide("foo")), &path.bytes[..]);
-            })
-        });
+        {
+            // Can't compare the Results as Eq isn't derived; thanks error-chain.
+            #![allow(clippy::unit_cmp)]
+            assert_eq!((), super::_apply_new_path(Some(wide("foo"))).unwrap());
+        }
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let environment = root
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+            .unwrap();
+        let path = environment.get_raw_value("PATH").unwrap();
+        assert_eq!(path.vtype, RegType::REG_EXPAND_SZ);
+        assert_eq!(super::to_winreg_bytes(wide("foo")), &path.bytes[..]);
     }
 
     #[test]
@@ -784,88 +956,78 @@ mod tests {
         use std::io;
         // during uninstall the PATH key may end up empty; if so we should
         // delete it.
-        let tp = currentprocess::TestProcess::default();
-        with_saved_path(&mut || {
-            currentprocess::with(tp.clone().into(), || {
-                let root = RegKey::predef(HKEY_CURRENT_USER);
-                let environment = root
-                    .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-                    .unwrap();
-                environment
-                    .set_raw_value(
-                        "PATH",
-                        &RegValue {
-                            bytes: super::to_winreg_bytes(wide("foo")),
-                            vtype: RegType::REG_EXPAND_SZ,
-                        },
-                    )
-                    .unwrap();
+        let _guard = RegistryGuard::new(&USER_PATH);
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let environment = root
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+            .unwrap();
+        environment
+            .set_raw_value(
+                "PATH",
+                &RegValue {
+                    bytes: super::to_winreg_bytes(wide("foo")),
+                    vtype: RegType::REG_EXPAND_SZ,
+                },
+            )
+            .unwrap();
 
-                {
-                    // Can't compare the Results as Eq isn't derived; thanks error-chain.
-                    #![allow(clippy::unit_cmp)]
-                    assert_eq!((), super::_apply_new_path(Some(Vec::new())).unwrap());
-                }
-                let reg_value = environment.get_raw_value("PATH");
-                match reg_value {
-                    Ok(_) => panic!("key not deleted"),
-                    Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(ref e) => panic!("error {e}"),
-                }
-            })
-        });
+        {
+            // Can't compare the Results as Eq isn't derived; thanks error-chain.
+            #![allow(clippy::unit_cmp)]
+            assert_eq!((), super::_apply_new_path(Some(Vec::new())).unwrap());
+        }
+        let reg_value = environment.get_raw_value("PATH");
+        match reg_value {
+            Ok(_) => panic!("key not deleted"),
+            Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(ref e) => panic!("error {e}"),
+        }
     }
 
     #[test]
     fn windows_doesnt_mess_with_a_non_string_path() {
         // This writes an error, so we want a sink for it.
-        let tp = currentprocess::TestProcess {
-            vars: [("HOME".to_string(), "/unused".to_string())]
+        let tp = TestProcess::with_vars(
+            [("HOME".to_string(), "/unused".to_string())]
                 .iter()
                 .cloned()
                 .collect(),
-            ..Default::default()
+        );
+
+        let _guard = RegistryGuard::new(&USER_PATH);
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let environment = root
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+            .unwrap();
+        let reg_value = RegValue {
+            bytes: vec![0x12, 0x34],
+            vtype: RegType::REG_BINARY,
         };
-        with_saved_path(&mut || {
-            currentprocess::with(tp.clone().into(), || {
-                let root = RegKey::predef(HKEY_CURRENT_USER);
-                let environment = root
-                    .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-                    .unwrap();
-                let reg_value = RegValue {
-                    bytes: vec![0x12, 0x34],
-                    vtype: RegType::REG_BINARY,
-                };
-                environment.set_raw_value("PATH", &reg_value).unwrap();
-                // Ok(None) signals no change to the PATH setting layer
-                assert_eq!(
-                    None,
-                    super::_with_path_cargo_home_bin(|_, _| panic!("called")).unwrap()
-                );
-            })
-        });
+        environment.set_raw_value("PATH", &reg_value).unwrap();
+        // Ok(None) signals no change to the PATH setting layer
         assert_eq!(
-            r"warning: the registry key HKEY_CURRENT_USER\Environment\PATH is not a string. Not modifying the PATH variable
+            None,
+            super::_with_path_cargo_home_bin(|_, _| panic!("called"), &tp.process).unwrap()
+        );
+
+        assert_eq!(
+            r"warn: the registry key HKEY_CURRENT_USER\Environment\PATH is not a string. Not modifying the PATH variable
 ",
-            String::from_utf8(tp.get_stderr()).unwrap()
+            String::from_utf8(tp.stderr()).unwrap()
         );
     }
 
     #[test]
     fn windows_treat_missing_path_as_empty() {
         // during install the PATH key may be missing; treat it as empty
-        let tp = currentprocess::TestProcess::default();
-        with_saved_path(&mut || {
-            currentprocess::with(tp.clone().into(), || {
-                let root = RegKey::predef(HKEY_CURRENT_USER);
-                let environment = root
-                    .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
-                    .unwrap();
-                environment.delete_value("PATH").unwrap();
+        let _guard = RegistryGuard::new(&USER_PATH);
+        let root = RegKey::predef(HKEY_CURRENT_USER);
+        let environment = root
+            .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
+            .unwrap();
+        environment.delete_value("PATH").unwrap();
 
-                assert_eq!(Some(Vec::new()), super::get_windows_path_var().unwrap());
-            })
-        });
+        assert_eq!(Some(Vec::new()), super::get_windows_path_var().unwrap());
     }
 
     #[test]

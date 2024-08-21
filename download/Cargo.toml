@@ -1,25 +1,30 @@
 [package]
 name = "download"
-version = "1.27.0"
+version = "1.27.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [features]
-
-default = ["reqwest-backend", "reqwest-rustls-tls", "reqwest-default-tls"]
-
+default = ["reqwest-backend", "reqwest-rustls-tls", "reqwest-native-tls"]
 curl-backend = ["curl"]
 reqwest-backend = ["reqwest", "env_proxy"]
-reqwest-default-tls = ["reqwest/default-tls"]
-reqwest-rustls-tls = ["reqwest/rustls-tls-native-roots"]
+reqwest-native-tls = ["reqwest/native-tls"]
+reqwest-rustls-tls = [
+  "reqwest/rustls-tls-manual-roots-no-provider",
+  "dep:rustls",
+  "dep:rustls-platform-verifier",
+]
 
 [dependencies]
 anyhow.workspace = true
 curl = { version = "0.4.44", optional = true }
 env_proxy = { version = "0.4.1", optional = true }
-once_cell.workspace = true
-reqwest = { version = "0.11", default-features = false, features = ["blocking", "gzip", "socks"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "gzip", "socks", "stream"], optional = true }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["logging", "aws_lc_rs", "tls12"] }
+rustls-platform-verifier = { version = "0.3", optional = true }
 thiserror.workspace = true
+tokio = { workspace = true, default-features = false, features = ["sync"] }
+tokio-stream.workspace = true
 url.workspace = true
 
 [dev-dependencies]
@@ -27,4 +32,3 @@ http-body-util = "0.1.0"
 hyper = { version = "1.0", default-features = false, features = ["server", "http1"] }
 hyper-util = { version = "0.1.1", features = ["tokio"] }
 tempfile.workspace = true
-tokio = { workspace = true, default-features = false, features = ["sync"] }

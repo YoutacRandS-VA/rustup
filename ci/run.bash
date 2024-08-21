@@ -8,7 +8,7 @@ rustc -vV
 cargo -vV
 
 
-FEATURES=('--no-default-features' '--features' 'curl-backend,reqwest-backend,reqwest-default-tls')
+FEATURES=('--no-default-features' '--features' 'curl-backend,reqwest-backend,reqwest-native-tls')
 case "$(uname -s)" in
   *NT* ) ;; # Windows NT
   * ) FEATURES+=('--features' 'vendored-openssl') ;;
@@ -20,7 +20,6 @@ case "$TARGET" in
   mips* ) ;;
   riscv* ) ;;
   s390x* ) ;;
-  aarch64-pc-windows-msvc ) ;;
   # default case, build with rustls enabled
   * ) FEATURES+=('--features' 'reqwest-rustls-tls') ;;
 esac
@@ -39,14 +38,13 @@ target_cargo() {
 target_cargo build
 
 download_pkg_test() {
-  features=('--no-default-features' '--features' 'curl-backend,reqwest-backend,reqwest-default-tls')
+  features=('--no-default-features' '--features' 'curl-backend,reqwest-backend,reqwest-native-tls')
   case "$TARGET" in
     # these platforms aren't supported by ring:
     powerpc* ) ;;
     mips* ) ;;
     riscv* ) ;;
     s390x* ) ;;
-    aarch64-pc-windows-msvc ) ;;
     # default case, build with rustls enabled
     * ) features+=('--features' 'reqwest-rustls-tls') ;;
   esac
@@ -66,18 +64,13 @@ build_test() {
   if [ "build" = "${cmd}" ]; then
     target_cargo "${cmd}" --workspace --all-targets --features test
   else
-    #  free runners have 2 or 3(mac) cores
-    target_cargo "${cmd}" --workspace --features test --tests -- --test-threads 2
-  fi
-
-  if [ "build" != "${cmd}" ]; then
+    target_cargo "${cmd}" --workspace --features test --tests
     target_cargo "${cmd}" --doc --workspace --features test
   fi
-
 }
 
 if [ -z "$SKIP_TESTS" ]; then
-  cargo run --locked --profile "$BUILD_PROFILE" --features test --target "$TARGET" "${FEATURES[@]}" -- --dump-testament
+  target_cargo run --features test -- --dump-testament
   build_test build
-  build_test test
+  RUSTUP_CI=1 build_test test
 fi

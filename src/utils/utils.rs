@@ -1,28 +1,60 @@
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Write};
+use std::ops::{BitAnd, BitAndAssign};
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 
 use anyhow::{anyhow, bail, Context, Result};
-use home::env as home;
 use retry::delay::{jitter, Fibonacci};
 use retry::{retry, OperationResult};
 use sha2::Sha256;
 use url::Url;
 
-use crate::currentprocess::{cwdsource::CurrentDirSource, varsource::VarSource};
 use crate::errors::*;
+use crate::process::Process;
 use crate::utils::notifications::Notification;
 use crate::utils::raw;
-use crate::{home_process, process};
 
 #[cfg(not(windows))]
 pub(crate) use crate::utils::utils::raw::find_cmd;
-pub(crate) use crate::utils::utils::raw::{if_not_empty, is_directory};
+pub(crate) use crate::utils::utils::raw::is_directory;
 
 pub use crate::utils::utils::raw::{is_file, path_exists};
 
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ExitCode(pub i32);
+
+impl BitAnd for ExitCode {
+    type Output = Self;
+
+    // If `self` is `0` (success), yield `rhs`.
+    fn bitand(self, rhs: Self) -> Self::Output {
+        match self.0 {
+            0 => rhs,
+            _ => self,
+        }
+    }
+}
+
+impl BitAndAssign for ExitCode {
+    // If `self` is `0` (success), set `self` to `rhs`.
+    fn bitand_assign(&mut self, rhs: Self) {
+        if self.0 == 0 {
+            *self = rhs
+        }
+    }
+}
+
+impl From<ExitStatus> for ExitCode {
+    fn from(status: ExitStatus) -> Self {
+        Self(match status.success() {
+            true => 0,
+            false => status.code().unwrap_or(1),
+        })
+    }
+}
 
 pub fn ensure_dir_exists<'a, N>(
     name: &'static str,
@@ -81,30 +113,6 @@ pub(crate) fn write_str(name: &'static str, file: &mut File, path: &Path, s: &st
     })
 }
 
-pub fn rename_file<'a, N>(
-    name: &'static str,
-    src: &'a Path,
-    dest: &'a Path,
-    notify: &'a dyn Fn(N),
-) -> Result<()>
-where
-    N: From<Notification<'a>>,
-{
-    rename(name, src, dest, notify)
-}
-
-pub(crate) fn rename_dir<'a, N>(
-    name: &'static str,
-    src: &'a Path,
-    dest: &'a Path,
-    notify: &'a dyn Fn(N),
-) -> Result<()>
-where
-    N: From<Notification<'a>>,
-{
-    rename(name, src, dest, notify)
-}
-
 pub(crate) fn filter_file<F: FnMut(&str) -> bool>(
     name: &'static str,
     src: &Path,
@@ -131,24 +139,35 @@ where
     })
 }
 
-pub fn download_file(
+pub async fn download_file(
     url: &Url,
     path: &Path,
     hasher: Option<&mut Sha256>,
     notify_handler: &dyn Fn(Notification<'_>),
+    process: &Process,
 ) -> Result<()> {
-    download_file_with_resume(url, path, hasher, false, &notify_handler)
+    download_file_with_resume(url, path, hasher, false, &notify_handler, process).await
 }
 
-pub(crate) fn download_file_with_resume(
+pub(crate) async fn download_file_with_resume(
     url: &Url,
     path: &Path,
     hasher: Option<&mut Sha256>,
     resume_from_partial: bool,
     notify_handler: &dyn Fn(Notification<'_>),
+    process: &Process,
 ) -> Result<()> {
     use download::DownloadError as DEK;
-    match download_file_(url, path, hasher, resume_from_partial, notify_handler) {
+    match download_file_(
+        url,
+        path,
+        hasher,
+        resume_from_partial,
+        notify_handler,
+        process,
+    )
+    .await
+    {
         Ok(_) => Ok(()),
         Err(e) => {
             if e.downcast_ref::<std::io::Error>().is_some() {
@@ -178,12 +197,13 @@ pub(crate) fn download_file_with_resume(
     }
 }
 
-fn download_file_(
+async fn download_file_(
     url: &Url,
     path: &Path,
     hasher: Option<&mut Sha256>,
     resume_from_partial: bool,
     notify_handler: &dyn Fn(Notification<'_>),
+    process: &Process,
 ) -> Result<()> {
     use download::download_to_path_with_backend;
     use download::{Backend, Event, TlsBackend};
@@ -221,19 +241,23 @@ fn download_file_(
     // Download the file
 
     // Keep the curl env var around for a bit
-    let use_curl_backend = process().var_os("RUSTUP_USE_CURL").is_some();
-    let use_rustls = process().var_os("RUSTUP_USE_RUSTLS").is_some();
+    let use_curl_backend = process
+        .var_os("RUSTUP_USE_CURL")
+        .map_or(false, |it| it != "0");
+    let use_rustls = process
+        .var_os("RUSTUP_USE_RUSTLS")
+        .map_or(true, |it| it != "0");
     let (backend, notification) = if use_curl_backend {
         (Backend::Curl, Notification::UsingCurl)
     } else {
         let tls_backend = if use_rustls {
             TlsBackend::Rustls
         } else {
-            #[cfg(feature = "reqwest-default-tls")]
+            #[cfg(feature = "reqwest-native-tls")]
             {
-                TlsBackend::Default
+                TlsBackend::NativeTls
             }
-            #[cfg(not(feature = "reqwest-default-tls"))]
+            #[cfg(not(feature = "reqwest-native-tls"))]
             {
                 TlsBackend::Rustls
             }
@@ -242,7 +266,8 @@ fn download_file_(
     };
     notify_handler(notification);
     let res =
-        download_to_path_with_backend(backend, url, path, resume_from_partial, Some(callback));
+        download_to_path_with_backend(backend, url, path, resume_from_partial, Some(callback))
+            .await;
 
     notify_handler(Notification::DownloadFinished);
 
@@ -477,56 +502,8 @@ pub(crate) fn make_executable(path: &Path) -> Result<()> {
     inner(path)
 }
 
-pub fn current_dir() -> Result<PathBuf> {
-    process()
-        .current_dir()
-        .context(RustupError::LocatingWorkingDir)
-}
-
 pub fn current_exe() -> Result<PathBuf> {
     env::current_exe().context(RustupError::LocatingWorkingDir)
-}
-
-pub(crate) fn to_absolute<P: AsRef<Path>>(path: P) -> Result<PathBuf> {
-    current_dir().map(|mut v| {
-        v.push(path);
-        v
-    })
-}
-
-pub(crate) fn home_dir() -> Option<PathBuf> {
-    home::home_dir_with_env(&home_process())
-}
-
-pub(crate) fn cargo_home() -> Result<PathBuf> {
-    home::cargo_home_with_env(&home_process()).context("failed to determine cargo home")
-}
-
-// Creates a ~/.rustup folder
-pub(crate) fn create_rustup_home() -> Result<()> {
-    // If RUSTUP_HOME is set then don't make any assumptions about where it's
-    // ok to put ~/.rustup
-    if process().var_os("RUSTUP_HOME").is_some() {
-        return Ok(());
-    }
-
-    let home = rustup_home_in_user_dir()?;
-    fs::create_dir_all(home).context("unable to create ~/.rustup")?;
-
-    Ok(())
-}
-
-fn dot_dir(name: &str) -> Option<PathBuf> {
-    home_dir().map(|p| p.join(name))
-}
-
-fn rustup_home_in_user_dir() -> Result<PathBuf> {
-    // XXX: This error message seems wrong/bogus.
-    dot_dir(".rustup").ok_or_else(|| anyhow::anyhow!("couldn't find value of RUSTUP_HOME"))
-}
-
-pub(crate) fn rustup_home() -> Result<PathBuf> {
-    home::rustup_home_with_env(&home_process()).context("failed to determine rustup home dir")
 }
 
 pub(crate) fn format_path_for_display(path: &str) -> String {
@@ -563,11 +540,13 @@ where
     }
 }
 
-fn rename<'a, N>(
+pub fn rename<'a, N>(
     name: &'static str,
     src: &'a Path,
     dest: &'a Path,
     notify_handler: &'a dyn Fn(N),
+    #[allow(unused_variables)] // Only used on Linux
+    process: &Process,
 ) -> Result<()>
 where
     N: From<Notification<'a>>,
@@ -588,7 +567,7 @@ where
                     OperationResult::Retry(e)
                 }
                 #[cfg(target_os = "linux")]
-                _ if process().var_os("RUSTUP_PERMIT_COPY_RENAME").is_some()
+                _ if process.var_os("RUSTUP_PERMIT_COPY_RENAME").is_some()
                     && Some(EXDEV) == e.raw_os_error() =>
                 {
                     match copy_and_delete(name, src, dest, notify_handler) {
@@ -610,8 +589,10 @@ where
     })
 }
 
-pub(crate) fn delete_dir_contents(dir_path: &Path) {
-    match remove_dir_all::remove_dir_contents(dir_path) {
+pub(crate) fn delete_dir_contents_following_links(dir_path: &Path) {
+    use remove_dir_all::RemoveDir;
+
+    match raw::open_dir_following_links(dir_path).and_then(|mut p| p.remove_dir_contents(None)) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => {
             panic!("Unable to clean up {}: {:?}", dir_path.display(), e);
         }
@@ -709,8 +690,6 @@ pub(crate) fn home_dir_from_passwd() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use rustup_macros::unit_test as test;
-
     use super::*;
 
     #[test]
